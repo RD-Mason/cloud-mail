@@ -27,6 +27,9 @@ const APP_CSP = [
 	"frame-ancestors 'self'"
 ];
 
+// HTTPS only for this hostname; no includeSubDomains so other (DNS-only) subdomains are unaffected.
+const HSTS = 'max-age=31536000';
+
 const OBJECT_CSP = "default-src 'none'; img-src 'self' data:; media-src 'self'; style-src 'unsafe-inline'; sandbox";
 
 // Types a browser only ever displays passively. Anything else is sent as a download.
@@ -84,6 +87,7 @@ export async function secureAssetResponse(env, req, res) {
 	const out = new Response(res.body, res);
 	out.headers.set('Content-Security-Policy', csp);
 	out.headers.set('X-Content-Type-Options', 'nosniff');
+	out.headers.set('Strict-Transport-Security', HSTS);
 	out.headers.set('X-Frame-Options', 'SAMEORIGIN');
 	out.headers.set('Referrer-Policy', 'strict-origin-when-cross-origin');
 	return out;
@@ -94,6 +98,7 @@ export function secureObjectResponse(res) {
 	cleanNullHeaders(out.headers);
 	out.headers.set('Content-Security-Policy', OBJECT_CSP);
 	out.headers.set('X-Content-Type-Options', 'nosniff');
+	out.headers.set('Strict-Transport-Security', HSTS);
 
 	const type = (out.headers.get('Content-Type') || '').trim();
 	if (!PASSIVE_TYPE.test(type)) {
@@ -129,6 +134,7 @@ export function secureTelegramPage(res) {
 		"form-action 'none'"
 	].join('; '));
 	out.headers.set('X-Content-Type-Options', 'nosniff');
+	out.headers.set('Strict-Transport-Security', HSTS);
 	out.headers.set('Referrer-Policy', 'no-referrer');
 	return out;
 }
@@ -136,6 +142,7 @@ export function secureTelegramPage(res) {
 export function secureApiResponse(res) {
 	const out = new Response(res.body, res);
 	out.headers.set('X-Content-Type-Options', 'nosniff');
+	out.headers.set('Strict-Transport-Security', HSTS);
 	if (!out.headers.has('Content-Security-Policy')) {
 		out.headers.set('Content-Security-Policy', "default-src 'none'; frame-ancestors 'none'");
 	}
