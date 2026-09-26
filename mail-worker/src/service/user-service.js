@@ -67,6 +67,12 @@ const userService = {
 		await orm(c).update(user).set({ password: hash, salt: salt }).where(eq(user.userId, userId)).run();
 	},
 
+	// Re-hash an already verified password with the current scheme (no policy checks).
+	async upgradePasswordHash(c, userId, password) {
+		const { salt, hash } = await cryptoUtils.hashPassword(password);
+		await orm(c).update(user).set({ password: hash, salt: salt }).where(eq(user.userId, userId)).run();
+	},
+
 	selectByEmail(c, email) {
 		return orm(c).select().from(user).where(
 			and(
