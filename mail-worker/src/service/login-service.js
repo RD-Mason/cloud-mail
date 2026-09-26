@@ -225,6 +225,15 @@ const loginService = {
 			throw new BizError(t('IncorrectPwd'));
 		}
 
+		if (!noVerifyPwd && cryptoUtils.needsRehash(userRow.password)) {
+			// Transparently move hashes from the old single SHA-256 scheme to PBKDF2.
+			try {
+				await userService.upgradePasswordHash(c, userRow.userId, password);
+			} catch (e) {
+				console.error('password hash upgrade failed', e);
+			}
+		}
+
 		const uuid = uuidv4();
 		const jwt = await JwtUtils.generateToken(c,{ userId: userRow.userId, token: uuid });
 
