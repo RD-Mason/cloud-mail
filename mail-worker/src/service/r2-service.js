@@ -48,7 +48,12 @@ const r2Service = {
 		}
 
 		if (storageType === 'R2') {
-			return await c.env.r2.get(key);
+			const obj = await c.env.r2.get(key);
+			if (obj) {
+				return obj;
+			}
+			// Objects stored before the R2 bucket was bound live in KV.
+			return await kvObjService.getObj(c, key);
 		}
 
 		if (storageType === 'S3') {
