@@ -131,6 +131,10 @@ import loading from "@/components/loading/index.vue";
 import {useRoute} from "vue-router";
 import {useI18n} from 'vue-i18n';
 
+function escapeHtml(value) {
+  return String(value ?? '').replace(/[&<>"']/g, ch => ({'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'}[ch]));
+}
+
 defineOptions({
   name: 'analysis'
 })
@@ -331,7 +335,8 @@ function createSenderPie() {
       },
       backgroundColor: topic.value.background,
       formatter: params => {
-        return `${params.marker} ${params.name}： ${params.value} (${params.percent}%)`;
+        // Sender names come from incoming mail; the tooltip renders HTML, so escape them.
+        return `${params.marker} ${escapeHtml(params.name)}： ${params.value} (${params.percent}%)`;
       }
     },
     legend: {
