@@ -5,6 +5,7 @@
 	"scripts": {
 		"dev": "wrangler dev --config wrangler-dev.toml",
 		"test": "wrangler deploy --config wrangler-test.toml",
+		"test:backfill": "vitest run --config vitest.backfill.config.js",
 		"deploy": "wrangler deploy",
 		"start": "wrangler dev"
 	},

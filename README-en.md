@@ -54,6 +54,7 @@ With only one domain, you can create multiple different email addresses, similar
 - **📦 Attachment Support**: Send and receive attachments, stored and downloaded via R2 object storage.
 
 - **🔔 Email Push**: Forward received emails to Telegram bots or other email providers.
+- **📨 Unread Email Backfill**: Administrators can preview and resend their stored unread emails in batches, with delivery records, pause/resume, and explicit failure retries. [Usage guide](doc/history-forwarding.md).
 
 - **📡 Open API**: Supports batch user creation via API and multi-condition email queries
 

@@ -4,3 +4,5 @@ allowBuilds:
   '@parcel/watcher': true
   esbuild: true
   vue-demi: true
+overrides:
+  defu: ^6.1.5

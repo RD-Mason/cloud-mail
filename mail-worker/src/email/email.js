@@ -12,6 +12,7 @@ import userService from '../service/user-service';
 import telegramService from '../service/telegram-service';
 import aiService from '../service/ai-service';
 import webhookService from '../service/webhook-service';
+import { recordAutomaticForward } from '../service/forward-backfill-service';
 
 export async function email(message, env, ctx) {
 
@@ -183,6 +184,11 @@ export async function email(message, env, ctx) {
 
 				try {
 					await message.forward(email);
+					try {
+						await recordAutomaticForward({ env }, emailRow, email);
+					} catch (recordError) {
+						console.error('记录自动转发结果失败：', recordError);
+					}
 				} catch (e) {
 					console.error(`转发邮箱 ${email} 失败：`, e);
 				}

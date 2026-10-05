@@ -1,6 +1,7 @@
 import settingService from '../service/setting-service';
 import emailUtils from '../utils/email-utils';
 import {emailConst} from "../const/entity-const";
+import { FORWARD_BACKFILL_SCHEMA } from '../lib/forward-backfill-schema';
 
 const dbInit = {
 	async init(c) {
@@ -32,8 +33,15 @@ const dbInit = {
 		await this.v3_1DB(c);
 		await this.v3_2DB(c);
 		await this.v3_3DB(c);
+		await this.historyForwardDB(c);
 		await settingService.refresh(c);
 		return c.text('success');
+	},
+
+	async historyForwardDB(c) {
+		for (const statement of FORWARD_BACKFILL_SCHEMA) {
+			await c.env.db.prepare(statement).run();
+		}
 	},
 
 	async v3_3DB(c) {
