@@ -1,6 +1,7 @@
 import emailService from './email-service';
 import { emailConst } from '../const/entity-const';
 import BizError from '../error/biz-error';
+import { handleForwardBackfillWebhook } from './forward-backfill-service';
 
 const resendService = {
 
@@ -41,6 +42,9 @@ const resendService = {
 		const emailRow = await emailService.updateEmailStatus(c, params)
 
 		if (!emailRow) {
+			if (await handleForwardBackfillWebhook(c, body)) {
+				return;
+			}
 			throw new BizError('更新邮件状态记录失败');
 		}
 

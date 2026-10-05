@@ -24,6 +24,9 @@ bucket_name = "cloud-mail"		#r2对象存储桶的名字
 #[[send_email]]
 #name = "email"			#CF发件, 配置后优先使用
 
+[[send_email]]
+name = "backfill_email"	#历史补转专用，仅发送到当前账户已验证的目标邮箱
+
 [ai]
 binding = "ai"
 

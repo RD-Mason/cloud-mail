@@ -25,6 +25,9 @@ bucket_name = "${R2_BUCKET_NAME}"
 [ai]
 binding = "ai"
 
+[[send_email]]
+name = "backfill_email"
+
 [assets]
 binding = "assets"
 directory = "./dist"

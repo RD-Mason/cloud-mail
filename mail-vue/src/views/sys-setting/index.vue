@@ -252,6 +252,14 @@
                   </el-button>
                 </div>
               </div>
+              <div v-if="userStore.user.type === 0" class="setting-item">
+                <div><span>{{ $t('forwardBackfill.title') }}</span></div>
+                <div>
+                  <el-button size="small" type="primary" @click="forwardBackfillShow = true">
+                    {{ $t('forwardBackfill.open') }}
+                  </el-button>
+                </div>
+              </div>
               <div class="setting-item">
                 <div><span>{{ $t('webhook') }}</span></div>
                 <div class="forward">
@@ -928,6 +936,7 @@ Authorization: &lt;secret&gt;</pre>
         <el-button type="primary" style="width: 100%;" :loading="settingLoading" @click="saveAiCodeFilter">{{ $t('save') }}</el-button>
       </el-dialog>
     </el-scrollbar>
+    <ForwardBackfillDialog v-if="userStore.user.type === 0" v-model="forwardBackfillShow"/>
   </div>
 </template>
 
@@ -948,6 +957,7 @@ import {getTextWidth} from "@/utils/text.js";
 import {fileToBase64} from "@/utils/file-utils.js"
 import {useI18n} from 'vue-i18n';
 import axios from "axios";
+import ForwardBackfillDialog from '@/components/ForwardBackfillDialog.vue';
 
 defineOptions({
   name: 'sys-setting'
@@ -973,6 +983,7 @@ const turnstileShow = ref(false)
 const tgSettingShow = ref(false)
 const noticePopupShow = ref(false)
 const thirdEmailShow = ref(false)
+const forwardBackfillShow = ref(false)
 const webhookShow = ref(false)
 const forwardRulesShow = ref(false)
 const emailPrefixShow = ref(false)
