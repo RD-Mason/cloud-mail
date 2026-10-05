@@ -35,6 +35,14 @@
 
 继续使用现有 Worker 名称、D1、KV、R2 和域名配置。新表和索引均使用 `IF NOT EXISTS`，在管理员首次打开功能或新邮件成功自动转发时增量创建；现有数据库升级入口也包含相同升级步骤。升级不会重建或清空原邮件和附件表。
 
+Cloudflare Workers Builds 的根目录使用 `/mail-worker`，Build command 应设置为：
+
+```sh
+pnpm --prefix ../mail-vue install --frozen-lockfile && pnpm --prefix ../mail-vue run build
+```
+
+这样分支预览也会先生成前端页面文件。生产 Deploy command 继续使用 `npx wrangler deploy`。
+
 本地业务验证：
 
 ```sh
