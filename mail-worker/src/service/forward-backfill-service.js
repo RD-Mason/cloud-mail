@@ -10,7 +10,7 @@ import { FORWARD_BACKFILL_SCHEMA } from '../lib/forward-backfill-schema';
 export const FORWARD_BACKFILL_LIMITS = { emails: 1000, deliveries: 2000, batch: 3 };
 const LEASE_MS = 5 * 60 * 1000;
 const SEND_TIMEOUT_MS = 30 * 1000;
-const SEND_INTERVAL_MS = 700;
+const RESEND_INTERVAL_MS = 700;
 const MAX_MESSAGE_BYTES = 5 * 1024 * 1024;
 const ADDRESS = /^[^\s@<>\r\n,]+@[^\s@<>\r\n,]+\.[^\s@<>\r\n,]+$/;
 const initializedSchemas = new WeakSet();
@@ -197,26 +197,31 @@ async function recoverExpired(c, job) {
 async function snapshot(c, userId, jobId) {
 	const job = await ownedJob(c, userId, jobId);
 	await recoverExpired(c, job);
-	const counts = await c.env.db.prepare(`SELECT COUNT(*) AS total, COUNT(DISTINCT email_id) AS sourceTotal,
-		SUM(status = 'sent') AS sent, SUM(status = 'failed') AS failed,
-		SUM(status = 'pending') AS pending, SUM(status = 'processing') AS processing,
-		SUM(status = 'unknown') AS unknown,
-		SUM(delivery_status = 'delivered') AS delivered,
-		SUM(delivery_status IN ('bounced', 'delivery_failed')) AS deliveryFailed
-		FROM forward_backfill_item WHERE job_id = ? AND user_id = ?`).bind(jobId, userId).first();
-	for (const key of ['total', 'sourceTotal', 'sent', 'failed', 'pending', 'processing', 'unknown', 'delivered', 'deliveryFailed']) counts[key] = Number(counts[key]) || 0;
 	// Derive status in the UPDATE itself so a concurrent status poll cannot overwrite a newer retry.
-	// Keep the user-wide execution slot until its final rate-limit delay has elapsed.
-	const updated = await c.env.db.prepare(`UPDATE forward_backfill_job SET status = CASE
-		WHEN lease_until > ? OR EXISTS (SELECT 1 FROM forward_backfill_item WHERE job_id = ? AND status IN ('pending', 'processing')) THEN 'running'
-		WHEN EXISTS (SELECT 1 FROM forward_backfill_item WHERE job_id = ? AND status = 'unknown') THEN 'needs_review'
-		WHEN EXISTS (SELECT 1 FROM forward_backfill_item WHERE job_id = ? AND status = 'failed') THEN 'completed_with_errors'
-		ELSE 'completed' END, updated_at = CURRENT_TIMESTAMP WHERE job_id = ? AND user_id = ? RETURNING status`)
-		.bind(Date.now(), jobId, jobId, jobId, jobId, userId).first();
-	const status = updated.status;
-	const errors = (await c.env.db.prepare(`SELECT email_id AS emailId, subject, target, message, status
-		FROM forward_backfill_item WHERE job_id = ? AND user_id = ? AND status IN ('failed', 'unknown') ORDER BY item_id LIMIT 100`)
-		.bind(jobId, userId).all()).results;
+	// A transaction returns a consistent status/count/error view in one D1 round trip.
+	const [updated, aggregate, failures] = await c.env.db.batch([
+		c.env.db.prepare(`UPDATE forward_backfill_job SET status = CASE
+			WHEN lease_until > ? OR EXISTS (SELECT 1 FROM forward_backfill_item WHERE job_id = ? AND status IN ('pending', 'processing')) THEN 'running'
+			WHEN EXISTS (SELECT 1 FROM forward_backfill_item WHERE job_id = ? AND status = 'unknown') THEN 'needs_review'
+			WHEN EXISTS (SELECT 1 FROM forward_backfill_item WHERE job_id = ? AND status = 'failed') THEN 'completed_with_errors'
+			ELSE 'completed' END, updated_at = CURRENT_TIMESTAMP WHERE job_id = ? AND user_id = ? RETURNING status`)
+			.bind(Date.now(), jobId, jobId, jobId, jobId, userId),
+		c.env.db.prepare(`SELECT COUNT(*) AS total, COUNT(DISTINCT email_id) AS sourceTotal,
+			SUM(status = 'sent') AS sent, SUM(status = 'failed') AS failed,
+			SUM(status = 'pending') AS pending, SUM(status = 'processing') AS processing,
+			SUM(status = 'unknown') AS unknown,
+			SUM(delivery_status = 'delivered') AS delivered,
+			SUM(delivery_status IN ('bounced', 'delivery_failed')) AS deliveryFailed
+			FROM forward_backfill_item WHERE job_id = ? AND user_id = ?`).bind(jobId, userId),
+		c.env.db.prepare(`SELECT email_id AS emailId, subject, target, message, status
+			FROM forward_backfill_item WHERE job_id = ? AND user_id = ? AND status IN ('failed', 'unknown') ORDER BY item_id LIMIT 100`)
+			.bind(jobId, userId)
+	]);
+	const counts = aggregate.results[0];
+	for (const key of ['total', 'sourceTotal', 'sent', 'failed', 'pending', 'processing', 'unknown', 'delivered', 'deliveryFailed']) counts[key] = Number(counts[key]) || 0;
+	const status = updated.results[0]?.status;
+	if (!status) throw new BizError('补转任务不存在或不属于当前账号', 404);
+	const errors = failures.results;
 	return { jobId, ...counts, status, targets: JSON.parse(job.targets), errors, createdAt: job.created_at,
 		providerAccepted: counts.sent, deliveryConfirmed: counts.total > 0 && counts.delivered === counts.total };
 }
@@ -228,6 +233,24 @@ async function readableMail(c, userId, item) {
 		AND a.is_del = 0 AND e.type = 0 AND e.status = 0 AND e.is_del = 0 AND e.unread = 0`)
 		.bind(item.email_id, item.account_id, userId, userId).first();
 	if (!row) throw new BizError('原邮件已删除、已读或邮箱归属发生变化，未发送', 400);
+	return row;
+}
+
+async function finalMailGuard(c, userId, item, jobId, token) {
+	// Recheck every authorization/state predicate immediately before sending without
+	// rereading the potentially large body. Verify both the job lease and item claim.
+	const row = await c.env.db.prepare(`SELECT e.email_id, e.to_email, a.email AS account_email
+		FROM email e JOIN account a ON a.account_id = e.account_id
+		WHERE e.email_id = ? AND e.account_id = ? AND e.user_id = ? AND a.user_id = ?
+		AND a.is_del = 0 AND e.type = 0 AND e.status = 0 AND e.is_del = 0 AND e.unread = 0
+		AND EXISTS (SELECT 1 FROM forward_backfill_job j WHERE j.job_id = ? AND j.user_id = ?
+			AND j.lease_token = ? AND j.lease_until > ?)
+		AND EXISTS (SELECT 1 FROM forward_backfill_item i WHERE i.item_id = ? AND i.job_id = ?
+			AND i.user_id = ? AND i.email_id = e.email_id AND i.account_id = e.account_id
+			AND i.status = 'processing' AND i.claim_token = ?)`)
+		.bind(item.email_id, item.account_id, userId, userId, jobId, userId, token, Date.now(),
+			item.item_id, jobId, userId, token).first();
+	if (!row) throw new BizError('原邮件已删除、已读、邮箱归属或任务执行凭据发生变化，未发送', 400);
 	return row;
 }
 
@@ -445,35 +468,61 @@ const forwardBackfillService = {
 			.bind(token, Date.now() + LEASE_MS, jobId, userId, Date.now()).run();
 		if (!claim.meta.changes) return snapshot(c, userId, jobId);
 		try {
-			for (let index = 0; index < FORWARD_BACKFILL_LIMITS.batch; index++) {
-				const item = await c.env.db.prepare(`UPDATE forward_backfill_item SET status = 'processing',
-					claim_token = ?, started_at = ?, attempts = attempts + 1, message = NULL, updated_at = CURRENT_TIMESTAMP
-					WHERE item_id = (SELECT item_id FROM forward_backfill_item WHERE job_id = ? AND user_id = ? AND status = 'pending' ORDER BY item_id LIMIT 1)
-					AND status = 'pending' AND EXISTS (SELECT 1 FROM forward_backfill_job WHERE job_id = ? AND lease_token = ? AND lease_until > ?)
-					RETURNING *`).bind(token, Date.now(), jobId, userId, jobId, token, Date.now()).first();
-				if (!item) break;
+			const claimed = await c.env.db.prepare(`UPDATE forward_backfill_item SET status = 'processing',
+				claim_token = ?, started_at = ?, attempts = attempts + 1, message = NULL, updated_at = CURRENT_TIMESTAMP
+				WHERE item_id IN (SELECT item_id FROM forward_backfill_item
+					WHERE job_id = ? AND user_id = ? AND status = 'pending' ORDER BY item_id LIMIT ${FORWARD_BACKFILL_LIMITS.batch})
+				AND job_id = ? AND user_id = ? AND status = 'pending'
+				AND EXISTS (SELECT 1 FROM forward_backfill_job WHERE job_id = ? AND user_id = ? AND lease_token = ? AND lease_until > ?)
+				RETURNING *`).bind(token, Date.now(), jobId, userId, jobId, userId, jobId, userId, token, Date.now()).all();
+			// Cloudflare items can overlap, while every Resend attempt shares this request's
+			// serial queue. Queue ownership stays under the persistent job lease.
+			let resendTail = Promise.resolve();
+			const queueResend = action => {
+				const task = resendTail.then(action);
+				resendTail = task.catch(() => {});
+				return task;
+			};
+			const processItem = async item => {
 				let submitted = false;
 				try {
 					const config = await forwardingConfig(c);
 					const row = await readableMail(c, userId, item);
 					permittedMail(row, config, item.target);
-					let selectedProvider = provider(c, config.setting, row.account_email);
-					if (!selectedProvider) throw new BizError('原收件域名尚未配置发信服务，未发送', 400);
+					if (!provider(c, config.setting, row.account_email)) throw new BizError('原收件域名尚未配置发信服务，未发送', 400);
 					const message = await buildForwardBackfillMessage(c, row, item.target, config.setting);
-					// Recheck ownership/read/delete/settings immediately before the external side effect.
-					const finalConfig = await forwardingConfig(c);
-					permittedMail(await readableMail(c, userId, item), finalConfig, item.target);
-					selectedProvider = provider(c, finalConfig.setting, row.account_email);
-					if (!selectedProvider) throw new BizError('原收件域名的发信服务已被移除，未发送', 400);
-					const lease = await c.env.db.prepare('SELECT 1 AS valid FROM forward_backfill_job WHERE job_id = ? AND lease_token = ? AND lease_until > ?')
-						.bind(jobId, token, Date.now()).first();
-					if (!lease) throw new BizError('任务执行凭据已失效，未发送', 400);
-					submitted = true;
-					const receipt = await sendMessage(selectedProvider, message, `cloud-mail-backfill-${item.item_id}-${item.attempts}`);
-					await c.env.db.prepare(`UPDATE forward_backfill_item SET status = 'sent', provider = ?, provider_id = ?,
-						delivery_status = 'provider_accepted', message = NULL, updated_at = CURRENT_TIMESTAMP
-						WHERE item_id = ? AND status = 'processing' AND claim_token = ?`)
-						.bind(receipt.provider, receipt.providerId, item.item_id, token).run();
+					const deliver = async (insideResendQueue = false) => {
+						const finalConfig = await forwardingConfig(c);
+						const proposedProvider = provider(c, finalConfig.setting, row.account_email);
+						if (!proposedProvider) throw new BizError('原收件域名的发信服务已被移除，未发送', 400);
+						if (proposedProvider.name === 'resend' && !insideResendQueue) {
+							return queueResend(() => deliver(true));
+						}
+						// A queued Resend item rechecks here, after waiting its turn, rather than
+						// relying on a stale authorization/read/lease check made before queuing.
+						const current = await finalMailGuard(c, userId, item, jobId, token);
+						permittedMail(current, finalConfig, item.target);
+						const selectedProvider = provider(c, finalConfig.setting, current.account_email);
+						if (!selectedProvider) throw new BizError('原收件域名的发信服务已被移除，未发送', 400);
+						if (selectedProvider.name === 'resend' && !insideResendQueue) {
+							return queueResend(() => deliver(true));
+						}
+						if (current.account_email !== message.from) throw new BizError('原收件邮箱地址发生变化，未发送', 400);
+						submitted = true;
+						try {
+							const receipt = await sendMessage(selectedProvider, message, `cloud-mail-backfill-${item.item_id}-${item.attempts}`);
+							// Persist each receipt immediately; do not wait for other providers in the batch.
+							await c.env.db.prepare(`UPDATE forward_backfill_item SET status = 'sent', provider = ?, provider_id = ?,
+								delivery_status = 'provider_accepted', message = NULL, updated_at = CURRENT_TIMESTAMP
+								WHERE item_id = ? AND status = 'processing' AND claim_token = ?`)
+								.bind(receipt.provider, receipt.providerId, item.item_id, token).run();
+						} finally {
+							// Retain the conservative Resend cadence, including after the last
+							// attempt, so a following batch cannot burst on the same provider.
+							if (selectedProvider.name === 'resend') await sleep(RESEND_INTERVAL_MS);
+						}
+					};
+					await deliver();
 				} catch (error) {
 					const unknown = error instanceof UnknownSendError || (submitted && !(error instanceof RejectedSendError));
 					const message = unknown ? `${cleanHeader(error.message)}；投递结果未知，请核对目标邮箱，系统不会自动重发` : cleanHeader(error.message || '发送失败');
@@ -481,9 +530,12 @@ const forwardBackfillService = {
 						WHERE item_id = ? AND status = 'processing' AND claim_token = ?`)
 						.bind(unknown ? 'unknown' : 'failed', message.slice(0, 1500), item.item_id, token).run();
 				}
-				// Also wait after the last delivery so immediately repeated batches remain below 2 req/s.
-				await sleep(SEND_INTERVAL_MS);
-			}
+			};
+			// An unexpected receipt/ledger failure must not release the job lease while
+			// another provider call is still in flight. Drain every item before finally.
+			const results = await Promise.allSettled(claimed.results.map(processItem));
+			const unexpectedFailure = results.find(result => result.status === 'rejected');
+			if (unexpectedFailure) throw unexpectedFailure.reason;
 		} finally {
 			await c.env.db.prepare('UPDATE forward_backfill_job SET lease_token = NULL, lease_until = 0 WHERE job_id = ? AND lease_token = ?')
 				.bind(jobId, token).run();

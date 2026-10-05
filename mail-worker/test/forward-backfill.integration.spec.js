@@ -47,6 +47,12 @@ async function startJob(params = {}) {
 	return forwardBackfillService.start(c, { ...params, cutoffId: preview.cutoffId, targets: preview.targets });
 }
 
+function deferred() {
+	let resolve;
+	const promise = new Promise(complete => { resolve = complete; });
+	return { promise, resolve };
+}
+
 beforeEach(async () => {
 	vi.clearAllMocks();
 	db = createLocalD1();
@@ -177,6 +183,170 @@ describe('history forwarding with real SQLite and mocked email providers', () =>
 		expect(await forwardBackfillService.status(c, { jobId: job.jobId }))
 			.toMatchObject({ sent: 1, pending: 0, failed: 0, status: 'completed', deliveryConfirmed: false });
 		expect(await originalEmail()).toEqual(original);
+	});
+
+	it('overlaps Cloudflare provider latency while keeping at most three sends active', async () => {
+		for (let emailId = 1; emailId <= 3; emailId++) await seedEmail({ emailId });
+		let active = 0;
+		let peakActive = 0;
+		mocks.cloudflareSend.mockImplementation(async () => {
+			active++;
+			peakActive = Math.max(peakActive, active);
+			try {
+				await new Promise(resolve => setTimeout(resolve, 100));
+				return { messageId: `overlapping-provider-${mocks.cloudflareSend.mock.calls.length}` };
+			} finally { active--; }
+		});
+		const job = await startJob();
+		const startedAt = performance.now();
+		const state = await forwardBackfillService.process(c, { jobId: job.jobId });
+		const elapsedMs = Math.round(performance.now() - startedAt);
+		expect(state).toMatchObject({ sent: 3, failed: 0, status: 'completed' });
+		expect(mocks.cloudflareSend).toHaveBeenCalledTimes(3);
+		expect(peakActive).toBeGreaterThan(1);
+		expect(peakActive).toBeLessThanOrEqual(3);
+		// The overlap is asserted; wall-clock duration is diagnostic only to avoid flaky CI.
+		console.info('Cloudflare mock latency benchmark', { deliveries: 3, providerLatencyMs: 100, peakActive, elapsedMs });
+	});
+
+	it('claims a three-email batch only once across competing process requests', async () => {
+		for (let emailId = 1; emailId <= 3; emailId++) await seedEmail({ emailId, subject: `Message ${emailId}` });
+		let active = 0;
+		let peakActive = 0;
+		mocks.cloudflareSend.mockImplementation(async form => {
+			active++;
+			peakActive = Math.max(peakActive, active);
+			await new Promise(resolve => setTimeout(resolve, 50));
+			active--;
+			return { messageId: `receipt-${form.subject}` };
+		});
+		const job = await startJob();
+		await Promise.all([
+			forwardBackfillService.process(c, { jobId: job.jobId }),
+			forwardBackfillService.process(c, { jobId: job.jobId })
+		]);
+		expect(mocks.cloudflareSend).toHaveBeenCalledTimes(3);
+		expect(new Set(mocks.cloudflareSend.mock.calls.map(([form]) => form.subject)).size).toBe(3);
+		expect(peakActive).toBeLessThanOrEqual(3);
+		expect(await forwardBackfillService.status(c, { jobId: job.jobId })).toMatchObject({ sent: 3, pending: 0 });
+	});
+
+	it('retains Resend spacing across consecutive batches instead of bursting at a batch boundary', async () => {
+		delete c.env.backfill_email;
+		mocks.settings.resendTokens = { 'example.com': 're_test_local_only' };
+		for (let emailId = 1; emailId <= 6; emailId++) await seedEmail({ emailId });
+		const callTimes = [];
+		mocks.resendSend.mockImplementation(async () => {
+			callTimes.push(performance.now());
+			return { data: { id: `resend-receipt-${callTimes.length}` }, error: null };
+		});
+		const job = await startJob();
+		expect(await forwardBackfillService.process(c, { jobId: job.jobId })).toMatchObject({ sent: 3, pending: 3 });
+		expect(await forwardBackfillService.process(c, { jobId: job.jobId })).toMatchObject({ sent: 6, pending: 0 });
+		expect(callTimes).toHaveLength(6);
+		for (let index = 1; index < callTimes.length; index++) {
+			// Allow timer measurement jitter while requiring the configured 700 ms pacing.
+			expect(callTimes[index] - callTimes[index - 1]).toBeGreaterThanOrEqual(650);
+		}
+		for (const start of callTimes) {
+			expect(callTimes.filter(time => time >= start && time < start + 1000).length).toBeLessThanOrEqual(2);
+		}
+		expect(mocks.cloudflareSend).not.toHaveBeenCalled();
+	}, 10000);
+
+	it('rechecks unread state when a prepared Cloudflare item falls back to the Resend queue', async () => {
+		await seedEmail({ emailId: 1, subject: 'Message 1' });
+		await seedEmail({ emailId: 2, subject: 'Message 2' });
+		await db.exec(`INSERT INTO attachments (att_id,user_id,email_id,account_id,key,filename,mime_type,size)
+			VALUES (1,1,1,1,'attachments/first.pdf','first.pdf','application/pdf',3),
+			(2,1,2,1,'attachments/second.pdf','second.pdf','application/pdf',3);`);
+		mocks.settings.resendTokens = { 'example.com': 're_test_local_only' };
+		const preparedBoth = deferred();
+		let prepared = 0;
+		mocks.getObject.mockImplementation(async () => {
+			prepared++;
+			if (prepared === 2) {
+				// Both items passed their first read with the native binding available.
+				delete c.env.backfill_email;
+				preparedBoth.resolve();
+			}
+			await preparedBoth.promise;
+			return new Uint8Array([1, 2, 3]).buffer;
+		});
+		let active = 0;
+		let peakActive = 0;
+		mocks.resendSend.mockImplementation(async form => {
+			active++;
+			peakActive = Math.max(peakActive, active);
+			try {
+				if (form.subject === 'Fwd: Message 1') {
+					await db.prepare('UPDATE email SET unread = 1 WHERE email_id = 2').run();
+					await new Promise(resolve => setTimeout(resolve, 50));
+				}
+				return { data: { id: `fallback-receipt-${form.subject}` }, error: null };
+			} finally { active--; }
+		});
+		const job = await startJob();
+		const state = await forwardBackfillService.process(c, { jobId: job.jobId });
+		expect(prepared).toBe(2);
+		expect(state).toMatchObject({ sent: 1, failed: 1, unknown: 0, processing: 0 });
+		expect(state.errors[0]).toMatchObject({ emailId: 2, status: 'failed' });
+		expect(state.errors[0].message).toMatch(/已读|归属/);
+		expect(mocks.cloudflareSend).not.toHaveBeenCalled();
+		expect(mocks.resendSend).toHaveBeenCalledTimes(1);
+		expect(mocks.resendSend.mock.calls[0][0].subject).toBe('Fwd: Message 1');
+		expect(peakActive).toBe(1);
+		expect((await originalEmail(1)).unread).toBe(0);
+		expect((await originalEmail(2)).unread).toBe(1);
+	});
+
+	it('keeps the execution lease until other pending sends settle when a receipt write fails', async () => {
+		for (let emailId = 1; emailId <= 3; emailId++) await seedEmail({ emailId, subject: `Message ${emailId}` });
+		const heldSecond = deferred();
+		const heldThird = deferred();
+		mocks.cloudflareSend.mockImplementation(form => {
+			if (form.subject === 'Fwd: Message 2') return heldSecond.promise;
+			if (form.subject === 'Fwd: Message 3') return heldThird.promise;
+			return Promise.resolve({ messageId: 'first-receipt' });
+		});
+		const job = await startJob();
+		let failedWrites = 0;
+		db.setExecutionHook(({ sql, values }) => {
+			if (/UPDATE forward_backfill_item SET status = (?:'sent'|\?)/.test(sql) && values[2] === 1) {
+				failedWrites++;
+				throw new Error('Injected receipt-storage outage');
+			}
+		});
+		let completed = false;
+		const processing = Promise.allSettled([forwardBackfillService.process(c, { jobId: job.jobId })])
+			.then(result => { completed = true; return result; });
+		try {
+			await vi.waitFor(() => {
+				expect(mocks.cloudflareSend).toHaveBeenCalledTimes(3);
+				expect(failedWrites).toBe(2);
+			});
+			const lease = await db.prepare('SELECT lease_token, lease_until FROM forward_backfill_job WHERE job_id = ?').bind(job.jobId).first();
+			expect(lease.lease_token).not.toBeNull();
+			expect(lease.lease_until).toBeGreaterThan(Date.now());
+			expect(completed).toBe(false);
+			await forwardBackfillService.process(c, { jobId: job.jobId });
+			expect(mocks.cloudflareSend).toHaveBeenCalledTimes(3);
+			heldSecond.resolve({ messageId: 'second-receipt' });
+			await vi.waitFor(async () => {
+				const count = await db.prepare("SELECT COUNT(*) AS total FROM forward_backfill_item WHERE status = 'sent'").first();
+				expect(count.total).toBe(1);
+			});
+			expect(completed).toBe(false);
+		} finally {
+			heldSecond.resolve({ messageId: 'second-receipt' });
+			heldThird.resolve({ messageId: 'third-receipt' });
+			await processing;
+		}
+		expect((await db.prepare('SELECT lease_token FROM forward_backfill_job WHERE job_id = ?').bind(job.jobId).first()).lease_token).toBeNull();
+		db.setExecutionHook(null);
+		expect(await forwardBackfillService.status(c, { jobId: job.jobId }))
+			.toMatchObject({ sent: 2, unknown: 1, processing: 0, status: 'needs_review' });
+		expect(mocks.cloudflareSend).toHaveBeenCalledTimes(3);
 	});
 
 	it('skips a successful mail/target across later jobs even while the original remains unread', async () => {

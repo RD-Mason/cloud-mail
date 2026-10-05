@@ -398,7 +398,8 @@ async function runBatches() {
         mustRefresh.value = true;
         break;
       }
-      if (hasUnfinishedJob.value && !stopRequested.value) await new Promise(resolve => setTimeout(resolve, 800));
+      // Give rendering and Pause a chance between batches without a long fixed wait.
+      if (hasUnfinishedJob.value && !stopRequested.value) await new Promise(resolve => setTimeout(resolve, 100));
     }
   } catch (error) {
     if (alive(currentSession)) {
