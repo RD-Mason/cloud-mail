@@ -3,9 +3,11 @@ import { DatabaseSync } from 'node:sqlite';
 // Execute production SQL against SQLite while exposing the asynchronous D1 shape.
 export function createLocalD1() {
 	const sqlite = new DatabaseSync(':memory:');
+	let executionHook;
 
 	function statement(sql, values = []) {
 		const execute = (method, options = {}) => {
+			executionHook?.({ sql, values: [...values], method });
 			const compiled = sqlite.prepare(sql);
 			const result = compiled[method](...values);
 			if (method === 'run') {
@@ -40,6 +42,7 @@ export function createLocalD1() {
 	}
 
 	return {
+		setExecutionHook: hook => { executionHook = hook; },
 		prepare: sql => statement(sql),
 		batch: async statements => {
 			sqlite.exec('BEGIN');
